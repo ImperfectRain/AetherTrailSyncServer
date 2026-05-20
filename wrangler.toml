@@ -1,4 +1,4 @@
-name = "aethertrail-sync-server"
+name = "aethertrailsyncserver"
 main = "src/index.ts"
 compatibility_date = "2026-05-20"
 
