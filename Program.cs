@@ -29,6 +29,12 @@ var jsonOptions = new JsonSerializerOptions
 
 app.MapGet("/", () => "AetherTrail Sync Server is running.");
 
+app.MapGet("/version", () => new
+{
+    version = "merge-normalized-v3",
+    time = DateTime.UtcNow
+});
+
 app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
     string room,
     uint territoryId,
@@ -49,11 +55,11 @@ app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
     if (string.IsNullOrWhiteSpace(json))
         return Results.BadRequest("Empty graph packet.");
 
-    GraphSyncPacket? incoming;
+    GraphSyncPacket? incomingRaw;
 
     try
     {
-        incoming = JsonSerializer.Deserialize<GraphSyncPacket>(json, jsonOptions);
+        incomingRaw = JsonSerializer.Deserialize<GraphSyncPacket>(json, jsonOptions);
     }
     catch (Exception ex)
     {
@@ -61,16 +67,18 @@ app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
         return Results.BadRequest("Invalid graph packet JSON.");
     }
 
-    if (incoming == null)
+    if (incomingRaw == null)
         return Results.BadRequest("Invalid graph packet.");
 
-    if (incoming.TerritoryId != territoryId)
+    if (incomingRaw.TerritoryId != territoryId)
         return Results.BadRequest("Territory mismatch.");
 
-    SanitizePacket(incoming);
+    SanitizePacket(incomingRaw);
 
-    if (incoming.Graph.Nodes.Count == 0)
+    if (incomingRaw.Graph.Nodes.Count == 0)
         return Results.BadRequest("Packet contains no valid nodes.");
+
+    var incoming = NormalizePacketForServer(incomingRaw);
 
     string key = BuildKey(room, territoryId);
     object roomLock = roomLocks.GetOrAdd(key, _ => new object());
@@ -86,6 +94,7 @@ app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
         if (!roomGraphs.TryGetValue(key, out GraphSyncPacket? existing))
         {
             roomGraphs[key] = incoming;
+
             before = 0;
             added = incoming.Graph.Nodes.Count;
             merged = 0;
@@ -103,23 +112,13 @@ app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
         }
     }
 
-    var first = incoming.Graph.Nodes.FirstOrDefault();
+    var stats = GetGraphStats(roomGraphs[key].Graph);
 
-    if (first != null)
-    {
-        Console.WriteLine(
-            $"UPLOAD/MERGE Room={room.Trim().ToUpperInvariant()} Territory={territoryId} " +
-            $"Incoming={incomingCount} Before={before} Added={added} Merged={merged} Stored={stored} " +
-            $"FirstPos=({first.Position.X:F2},{first.Position.Y:F2},{first.Position.Z:F2})"
-        );
-    }
-    else
-    {
-        Console.WriteLine(
-            $"UPLOAD/MERGE Room={room.Trim().ToUpperInvariant()} Territory={territoryId} " +
-            $"Incoming={incomingCount} Before={before} Added={added} Merged={merged} Stored={stored}"
-        );
-    }
+    Console.WriteLine(
+        $"UPLOAD/MERGE Room={room.Trim().ToUpperInvariant()} Territory={territoryId} " +
+        $"Incoming={incomingCount} Before={before} Added={added} Merged={merged} Stored={stored} " +
+        $"Bounds=({stats.MinX:F1},{stats.MinY:F1},{stats.MinZ:F1})-({stats.MaxX:F1},{stats.MaxY:F1},{stats.MaxZ:F1})"
+    );
 
     return Results.Ok(new
     {
@@ -130,7 +129,8 @@ app.MapPost("/rooms/{room}/graphs/{territoryId}", async (
         beforeNodes = before,
         addedNodes = added,
         mergedNodes = merged,
-        storedNodes = stored
+        storedNodes = stored,
+        stats
     });
 });
 
@@ -172,7 +172,12 @@ app.MapGet("/rooms/{room}/graphs/{territoryId}/stats", (
         links = packet.Graph.Nodes.Sum(node => node.Links.Count),
         groundNodes = packet.Graph.Nodes.Count(node => node.TraversalMode == NavTraversalMode.Ground),
         flightNodes = packet.Graph.Nodes.Count(node => node.TraversalMode == NavTraversalMode.Flight),
-        firstNode = packet.Graph.Nodes.FirstOrDefault()
+        duplicateIds = packet.Graph.Nodes
+            .GroupBy(node => node.Id)
+            .Where(group => group.Count() > 1)
+            .Select(group => new { id = group.Key, count = group.Count() })
+            .ToList(),
+        bounds = GetGraphStats(packet.Graph)
     });
 });
 
@@ -197,7 +202,7 @@ static bool IsValidRoom(string room)
 static void SanitizePacket(GraphSyncPacket packet)
 {
     const int maxNodes = 25_000;
-    const int maxLinksPerNode = 16;
+    const int maxLinksPerNode = 24;
     const int maxConfidence = 100;
 
     packet.Graph ??= new NavGraph();
@@ -248,12 +253,104 @@ static void SanitizePacket(GraphSyncPacket packet)
     }
 }
 
+static GraphSyncPacket NormalizePacketForServer(GraphSyncPacket packet)
+{
+    Dictionary<string, string> firstIdMap = new();
+    Dictionary<string, string> exactNodeMap = new();
+
+    var normalized = new GraphSyncPacket
+    {
+        Version = packet.Version,
+        TerritoryId = packet.TerritoryId,
+        SenderId = packet.SenderId,
+        CreatedAtUtc = packet.CreatedAtUtc,
+        Graph = new NavGraph()
+    };
+
+    foreach (var node in packet.Graph.Nodes)
+    {
+        string serverId = $"server_{Guid.NewGuid():N}";
+
+        var normalizedNode = new NavNode
+        {
+            Id = serverId,
+            Position = node.Position,
+            TraversalMode = node.TraversalMode,
+            Links = new List<string>(),
+            LinkConfidence = new Dictionary<string, int>()
+        };
+
+        normalized.Graph.Nodes.Add(normalizedNode);
+
+        string exactKey = BuildExactNodeKey(node);
+        exactNodeMap[exactKey] = serverId;
+
+        if (!firstIdMap.ContainsKey(node.Id))
+            firstIdMap[node.Id] = serverId;
+    }
+
+    var normalizedById = normalized.Graph.Nodes.ToDictionary(node => node.Id);
+
+    foreach (var originalNode in packet.Graph.Nodes)
+    {
+        string sourceExactKey = BuildExactNodeKey(originalNode);
+
+        if (!exactNodeMap.TryGetValue(sourceExactKey, out string? sourceServerId))
+            continue;
+
+        var source = normalizedById[sourceServerId];
+
+        foreach (string originalLinkId in originalNode.Links)
+        {
+            if (!firstIdMap.TryGetValue(originalLinkId, out string? targetServerId))
+                continue;
+
+            if (targetServerId == sourceServerId)
+                continue;
+
+            if (!normalizedById.TryGetValue(targetServerId, out var destination))
+                continue;
+
+            if (source.TraversalMode != destination.TraversalMode)
+                continue;
+
+            if (!IsTraversableLink(source.Position, destination.Position))
+                continue;
+
+            AddLink(source, destination);
+
+            int confidence = originalNode.LinkConfidence.TryGetValue(originalLinkId, out int value)
+                ? value
+                : 1;
+
+            confidence = Math.Clamp(confidence, 1, 100);
+
+            source.LinkConfidence[destination.Id] = Math.Max(
+                source.LinkConfidence.TryGetValue(destination.Id, out int existing) ? existing : 1,
+                confidence
+            );
+
+            destination.LinkConfidence[source.Id] = Math.Max(
+                destination.LinkConfidence.TryGetValue(source.Id, out int reverseExisting) ? reverseExisting : 1,
+                confidence
+            );
+        }
+    }
+
+    return normalized;
+}
+
+static string BuildExactNodeKey(NavNode node)
+{
+    return $"{node.Id}|{node.Position.X:R}|{node.Position.Y:R}|{node.Position.Z:R}|{node.TraversalMode}";
+}
+
 static MergeResult MergePacket(GraphSyncPacket target, GraphSyncPacket incoming)
 {
     const float mergeDistance = 0.75f;
 
     Dictionary<string, string> idMap = new();
-    Dictionary<string, NavNode> targetById = target.Graph.Nodes.ToDictionary(node => node.Id);
+    Dictionary<string, NavNode> targetById = BuildNodeLookup(target.Graph);
 
     int addedNodes = 0;
     int mergedNodes = 0;
@@ -340,6 +437,22 @@ static MergeResult MergePacket(GraphSyncPacket target, GraphSyncPacket incoming)
     }
 
     return new MergeResult(addedNodes, mergedNodes);
+}
+
+static Dictionary<string, NavNode> BuildNodeLookup(NavGraph graph)
+{
+    Dictionary<string, NavNode> lookup = new();
+
+    foreach (var node in graph.Nodes)
+    {
+        if (string.IsNullOrWhiteSpace(node.Id))
+            continue;
+
+        if (!lookup.ContainsKey(node.Id))
+            lookup[node.Id] = node;
+    }
+
+    return lookup;
 }
 
 static NavNode? FindNearestCompatibleNode(NavGraph graph, NavNode incomingNode, float maxDistance)
@@ -447,7 +560,33 @@ static float DistanceSquared(Vector3Dto a, Vector3Dto b)
     return x * x + y * y + z * z;
 }
 
+static GraphStats GetGraphStats(NavGraph graph)
+{
+    if (graph.Nodes.Count == 0)
+        return new GraphStats();
+
+    return new GraphStats
+    {
+        MinX = graph.Nodes.Min(node => node.Position.X),
+        MinY = graph.Nodes.Min(node => node.Position.Y),
+        MinZ = graph.Nodes.Min(node => node.Position.Z),
+        MaxX = graph.Nodes.Max(node => node.Position.X),
+        MaxY = graph.Nodes.Max(node => node.Position.Y),
+        MaxZ = graph.Nodes.Max(node => node.Position.Z)
+    };
+}
+
 public sealed record MergeResult(int AddedNodes, int MergedNodes);
+
+public sealed class GraphStats
+{
+    public float MinX { get; set; }
+    public float MinY { get; set; }
+    public float MinZ { get; set; }
+    public float MaxX { get; set; }
+    public float MaxY { get; set; }
+    public float MaxZ { get; set; }
+}
 
 public sealed class GraphSyncPacket
 {
