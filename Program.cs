@@ -19,6 +19,7 @@ app.UseCors();
 
 var roomGraphs = new ConcurrentDictionary<string, GraphSyncPacket>();
 var roomLocks = new ConcurrentDictionary<string, object>();
+var roomPresences = new ConcurrentDictionary<string, ConcurrentDictionary<string, PartySyncPresence>>();
 
 var jsonOptions = new JsonSerializerOptions
 {
@@ -179,6 +180,95 @@ app.MapGet("/rooms/{room}/graphs/{territoryId}/stats", (
             .ToList(),
         bounds = GetGraphStats(packet.Graph)
     });
+});
+
+app.MapPost("/rooms/{room}/presence/{territoryId}", async (
+    string room,
+    uint territoryId,
+    HttpRequest request) =>
+{
+    if (!IsValidRoom(room))
+        return Results.BadRequest("Invalid room code.");
+
+    if (territoryId == 0 || territoryId > 20_000)
+        return Results.BadRequest("Invalid territory.");
+
+    if (request.ContentLength is null or > 50_000)
+        return Results.BadRequest("Presence packet too large.");
+
+    using var reader = new StreamReader(request.Body);
+    string json = await reader.ReadToEndAsync();
+
+    if (string.IsNullOrWhiteSpace(json))
+        return Results.BadRequest("Empty presence packet.");
+
+    PartySyncPresence? presence;
+
+    try
+    {
+        presence = JsonSerializer.Deserialize<PartySyncPresence>(json, jsonOptions);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"BAD PRESENCE JSON Room={room} Territory={territoryId} Error={ex.Message}");
+        return Results.BadRequest("Invalid presence JSON.");
+    }
+
+    if (presence == null)
+        return Results.BadRequest("Invalid presence packet.");
+
+    if (presence.TerritoryId != territoryId)
+        return Results.BadRequest("Territory mismatch.");
+
+    if (string.IsNullOrWhiteSpace(presence.SenderId))
+        return Results.BadRequest("Missing sender.");
+
+    if (!IsValidNodePosition(presence.Position))
+        return Results.BadRequest("Invalid position.");
+
+    presence.UpdatedAtUtc = DateTime.UtcNow;
+
+    string key = BuildKey(room, territoryId);
+
+    var presenceMap = roomPresences.GetOrAdd(
+        key,
+        _ => new ConcurrentDictionary<string, PartySyncPresence>()
+    );
+
+    presenceMap[presence.SenderId] = presence;
+
+    Console.WriteLine(
+        $"PRESENCE Room={room.Trim().ToUpperInvariant()} Territory={territoryId} " +
+        $"Sender={presence.SenderId} Pos=({presence.Position.X:F1},{presence.Position.Y:F1},{presence.Position.Z:F1})"
+    );
+
+    return Results.Ok(new
+    {
+        success = true
+    });
+});
+
+app.MapGet("/rooms/{room}/presence/{territoryId}", (
+    string room,
+    uint territoryId) =>
+{
+    if (!IsValidRoom(room))
+        return Results.BadRequest("Invalid room code.");
+
+    string key = BuildKey(room, territoryId);
+
+    if (!roomPresences.TryGetValue(key, out var presenceMap))
+        return Results.Ok(new List<PartySyncPresence>());
+
+    DateTime cutoff = DateTime.UtcNow - TimeSpan.FromSeconds(45);
+
+    foreach (var pair in presenceMap.ToList())
+    {
+        if (pair.Value.UpdatedAtUtc < cutoff)
+            presenceMap.TryRemove(pair.Key, out _);
+    }
+
+    return Results.Ok(presenceMap.Values.ToList());
 });
 
 app.Run();
@@ -578,6 +668,18 @@ static GraphStats GetGraphStats(NavGraph graph)
 
 public sealed record MergeResult(int AddedNodes, int MergedNodes);
 
+public sealed class PartySyncPresence
+{
+    public string SenderId { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+
+    public uint TerritoryId { get; set; }
+
+    public Vector3Dto Position { get; set; }
+    public float RotationRadians { get; set; }
+
+    public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+}
 public sealed class GraphStats
 {
     public float MinX { get; set; }
