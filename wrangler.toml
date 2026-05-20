@@ -1,0 +1,5 @@
+name = "aethertrail-sync-server"
+main = "src/index.ts"
+compatibility_date = "2026-05-20"
+
+workers_dev = true
