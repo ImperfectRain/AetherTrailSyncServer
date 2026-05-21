@@ -41,6 +41,15 @@ interface PartySyncPresence {
   UpdatedAtUtc: string;
 }
 
+interface ChatMessage {
+  Id: string;
+  Room: string;
+  SenderId: string;
+  SenderName: string;
+  Text: string;
+  CreatedAtUtc: string;
+}
+
 interface MergeResult {
   addedNodes: number;
   mergedNodes: number;
@@ -63,28 +72,37 @@ export default {
 
     const graphMatch = url.pathname.match(/^\/rooms\/([^/]+)\/graphs\/(\d+)(?:\/stats)?$/);
     const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)(?:\/sync)?$/);
+    const chatMatch = url.pathname.match(/^\/rooms\/([^/]+)\/chat(?:\/sync)?$/);
 
-    const match = graphMatch ?? presenceMatch;
+    const match = graphMatch ?? presenceMatch ?? chatMatch;
 
     if (!match) {
       return new Response("Not found.", { status: 404 });
     }
 
     const room = normalizeRoom(match[1]);
-    const territoryId = Number(match[2]);
 
-    if (!isValidRoom(room)) {
-      return new Response("Invalid room code.", { status: 400 });
-    }
+if (!isValidRoom(room)) {
+  return new Response("Invalid room code.", { status: 400 });
+}
 
-    if (!Number.isInteger(territoryId) || territoryId <= 0 || territoryId > 20000) {
-      return new Response("Invalid territory.", { status: 400 });
-    }
+if (chatMatch) {
+  const id = env.ROOM.idFromName(`${room}:chat`);
+  const stub = env.ROOM.get(id);
 
-    const id = env.ROOM.idFromName(`${room}:${territoryId}`);
-    const stub = env.ROOM.get(id);
+  return stub.fetch(request);
+}
 
-    return stub.fetch(request);
+const territoryId = Number(match[2]);
+
+if (!Number.isInteger(territoryId) || territoryId <= 0 || territoryId > 20000) {
+  return new Response("Invalid territory.", { status: 400 });
+}
+
+const id = env.ROOM.idFromName(`${room}:${territoryId}`);
+const stub = env.ROOM.get(id);
+
+return stub.fetch(request);
   },
 };
 
@@ -101,6 +119,7 @@ export class AetherTrailRoom extends DurableObject<Env> {
 
     const graphMatch = url.pathname.match(/^\/rooms\/([^/]+)\/graphs\/(\d+)(?:\/stats)?$/);
     const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)(?:\/sync)?$/);
+    const chatMatch = url.pathname.match(/^\/rooms\/([^/]+)\/chat(?:\/sync)?$/);
 
     if (graphMatch) {
       const room = normalizeRoom(graphMatch[1]);
@@ -138,6 +157,19 @@ export class AetherTrailRoom extends DurableObject<Env> {
       }
     }
 
+    if (chatMatch) {
+      const room = normalizeRoom(chatMatch[1]);
+      const isSync = url.pathname.endsWith("/sync");
+    
+      if (isSync && request.method === "POST") {
+        return this.syncChat(room, request);
+      }
+    
+      if (request.method === "GET") {
+        return this.downloadChat(room, request);
+      }
+    }
+
     return new Response("Not found.", { status: 404 });
   }
 
@@ -159,6 +191,8 @@ export class AetherTrailRoom extends DurableObject<Env> {
     if (!incomingRaw || incomingRaw.TerritoryId !== territoryId) {
       return new Response("Territory mismatch.", { status: 400 });
     }
+
+    
 
     sanitizePacket(incomingRaw);
 
@@ -209,6 +243,58 @@ export class AetherTrailRoom extends DurableObject<Env> {
     });
   }
 
+  private async syncChat(room: string, request: Request): Promise<Response> {
+    const contentLength = Number(request.headers.get("content-length") ?? "0");
+  
+    if (!Number.isFinite(contentLength) || contentLength <= 0 || contentLength > 20_000) {
+      return new Response("Chat message too large.", { status: 400 });
+    }
+  
+    let message: ChatMessage;
+  
+    try {
+      message = await request.json() as ChatMessage;
+    } catch {
+      return new Response("Invalid chat JSON.", { status: 400 });
+    }
+  
+    const normalized = sanitizeChatMessage(room, message);
+  
+    if (!normalized) {
+      return new Response("Invalid chat message.", { status: 400 });
+    }
+  
+    const messages =
+      (await this.durableState.storage.get<ChatMessage[]>("chat")) ?? [];
+  
+    messages.push(normalized);
+  
+    const trimmed = trimChatMessages(messages);
+  
+    await this.durableState.storage.put("chat", trimmed);
+  
+    console.log(
+      `CHAT/SYNC Room=${room} Sender=${normalized.SenderId} Count=${trimmed.length}`
+    );
+  
+    return Response.json(trimmed);
+  }
+  
+  private async downloadChat(room: string, request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const sinceRaw = url.searchParams.get("since");
+    const sinceMs = sinceRaw ? Date.parse(sinceRaw) : NaN;
+  
+    const messages =
+      (await this.durableState.storage.get<ChatMessage[]>("chat")) ?? [];
+  
+    const filtered = Number.isFinite(sinceMs)
+      ? messages.filter((message) => Date.parse(message.CreatedAtUtc) > sinceMs)
+      : messages;
+  
+    return Response.json(filtered);
+  }
+
   private async downloadGraph(room: string, territoryId: number): Promise<Response> {
     const packet = await this.durableState.storage.get<GraphSyncPacket>("graph");
 
@@ -243,6 +329,8 @@ export class AetherTrailRoom extends DurableObject<Env> {
       bounds: stats,
     });
   }
+
+  
 
   private async uploadPresence(room: string, territoryId: number, request: Request): Promise<Response> {
     const contentLength = Number(request.headers.get("content-length") ?? "0");
@@ -605,15 +693,7 @@ function addLink(a: NavNode, b: NavNode): void {
   b.LinkConfidence[a.Id] ??= 1;
 }
 
-function mergeNodeConfidence(target: NavNode, incoming: NavNode): void {
-  for (const [key, value] of Object.entries(incoming.LinkConfidence)) {
-    const confidence = clampNumber(value, 1, 100);
 
-    if ((target.LinkConfidence[key] ?? 0) < confidence) {
-      target.LinkConfidence[key] = confidence;
-    }
-  }
-}
 
 function isValidPosition(position: Vector3Dto | undefined): position is Vector3Dto {
   if (!position) {
@@ -721,4 +801,75 @@ function prunePresenceMap(presences: Record<string, PartySyncPresence>): void {
       delete presences[senderId];
     }
   }
+}
+
+function sanitizeChatMessage(room: string, message: ChatMessage): ChatMessage | null {
+  if (!message) {
+    return null;
+  }
+
+  const senderId = typeof message.SenderId === "string"
+    ? message.SenderId.trim()
+    : "";
+
+  const senderName = typeof message.SenderName === "string"
+    ? sanitizeChatText(message.SenderName, 48)
+    : "Unknown";
+
+  const text = typeof message.Text === "string"
+    ? sanitizeChatText(message.Text, 500)
+    : "";
+
+  if (!senderId || !text) {
+    return null;
+  }
+
+  return {
+    Id: typeof message.Id === "string" && message.Id.trim()
+      ? message.Id.trim().slice(0, 80)
+      : crypto.randomUUID().replace(/-/g, ""),
+    Room: room,
+    SenderId: senderId.slice(0, 80),
+    SenderName: senderName || "Unknown",
+    Text: text,
+    CreatedAtUtc: new Date().toISOString(),
+  };
+}
+
+function sanitizeChatText(text: string, maxLength: number): string {
+  return text
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function trimChatMessages(messages: ChatMessage[]): ChatMessage[] {
+  const maxMessages = 100;
+  const maxCharacters = 40_000;
+
+  let trimmed = messages.slice(-maxMessages);
+  let totalCharacters = getChatCharacterCount(trimmed);
+
+  while (trimmed.length > 0 && totalCharacters > maxCharacters) {
+    const removed = trimmed.shift();
+
+    if (!removed) {
+      break;
+    }
+
+    totalCharacters -=
+      removed.Text.length +
+      removed.SenderName.length +
+      64;
+  }
+
+  return trimmed;
+}
+
+function getChatCharacterCount(messages: ChatMessage[]): number {
+  return messages.reduce(
+    (sum, message) => sum + message.Text.length + message.SenderName.length + 64,
+    0
+  );
 }
