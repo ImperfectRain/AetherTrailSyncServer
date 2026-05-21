@@ -446,8 +446,7 @@ function mergePacket(target: GraphSyncPacket, incoming: GraphSyncPacket): MergeR
 
     if (existingNode) {
       idMap.set(incomingNode.Id, existingNode.Id);
-      mergeNodeConfidence(existingNode, incomingNode);
-      mergedNodes++;
+            mergedNodes++;
       continue;
     }
 
