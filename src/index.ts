@@ -62,7 +62,7 @@ export default {
     }
 
     const graphMatch = url.pathname.match(/^\/rooms\/([^/]+)\/graphs\/(\d+)(?:\/stats)?$/);
-    const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)$/);
+    const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)(?:\/sync)?$/);
 
     const match = graphMatch ?? presenceMatch;
 
@@ -100,7 +100,7 @@ export class AetherTrailRoom extends DurableObject<Env> {
     const url = new URL(request.url);
 
     const graphMatch = url.pathname.match(/^\/rooms\/([^/]+)\/graphs\/(\d+)(?:\/stats)?$/);
-    const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)$/);
+    const presenceMatch = url.pathname.match(/^\/rooms\/([^/]+)\/presence\/(\d+)(?:\/sync)?$/);
 
     if (graphMatch) {
       const room = normalizeRoom(graphMatch[1]);
@@ -123,11 +123,16 @@ export class AetherTrailRoom extends DurableObject<Env> {
     if (presenceMatch) {
       const room = normalizeRoom(presenceMatch[1]);
       const territoryId = Number(presenceMatch[2]);
-
+      const isSync = url.pathname.endsWith("/sync");
+    
+      if (isSync && request.method === "POST") {
+        return this.syncPresence(room, territoryId, request);
+      }
+    
       if (request.method === "POST") {
         return this.uploadPresence(room, territoryId, request);
       }
-
+    
       if (request.method === "GET") {
         return this.downloadPresence(room, territoryId);
       }
@@ -276,6 +281,47 @@ export class AetherTrailRoom extends DurableObject<Env> {
     );
 
     return Response.json({ success: true });
+  }
+
+  private async syncPresence(room: string, territoryId: number, request: Request): Promise<Response> {
+    const contentLength = Number(request.headers.get("content-length") ?? "0");
+  
+    if (!Number.isFinite(contentLength) || contentLength <= 0 || contentLength > 50_000) {
+      return new Response("Presence packet too large.", { status: 400 });
+    }
+  
+    let presence: PartySyncPresence;
+  
+    try {
+      presence = await request.json() as PartySyncPresence;
+    } catch {
+      return new Response("Invalid presence JSON.", { status: 400 });
+    }
+  
+    if (!presence || presence.TerritoryId !== territoryId) {
+      return new Response("Territory mismatch.", { status: 400 });
+    }
+  
+    if (!presence.SenderId || !isValidPosition(presence.Position)) {
+      return new Response("Invalid presence.", { status: 400 });
+    }
+  
+    presence.UpdatedAtUtc = new Date().toISOString();
+  
+    const presences =
+      (await this.durableState.storage.get<Record<string, PartySyncPresence>>("presence")) ?? {};
+  
+    presences[presence.SenderId] = presence;
+  
+    prunePresenceMap(presences);
+  
+    await this.durableState.storage.put("presence", presences);
+  
+    console.log(
+      `PRESENCE/SYNC Room=${room} Territory=${territoryId} Sender=${presence.SenderId} Count=${Object.keys(presences).length}`
+    );
+  
+    return Response.json(Object.values(presences));
   }
 
   private async downloadPresence(room: string, territoryId: number): Promise<Response> {
@@ -446,7 +492,7 @@ function mergePacket(target: GraphSyncPacket, incoming: GraphSyncPacket): MergeR
 
     if (existingNode) {
       idMap.set(incomingNode.Id, existingNode.Id);
-            mergedNodes++;
+      mergedNodes++;
       continue;
     }
 

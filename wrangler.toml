@@ -11,3 +11,7 @@ class_name = "AetherTrailRoom"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AetherTrailRoom"]
+
+[observability.logs]
+enabled = true
+invocation_logs = true

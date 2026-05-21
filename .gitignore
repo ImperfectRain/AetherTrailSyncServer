@@ -2,3 +2,13 @@
 bin/
 obj/
 *.user
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+build/
+.DS_Store
+
+# local/optional files
+*.sln
+readme.md
